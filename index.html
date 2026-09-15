@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gamma-Native LNbits Extension Proposal</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>
+    const savedTheme = localStorage.getItem('proposal-theme')
+    const initialTheme = savedTheme || 'dark'
+    document.documentElement.dataset.theme = initialTheme
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --background: #f4f7fa;
+      --surface: #ffffff;
+      --surface-alt: #e9f2f7;
+      --ink: #060911;
+      --strong: #060911;
+      --muted: #5b6b80;
+      --border: rgba(6, 9, 17, 0.14);
+      --accent: #0077cc;
+      --accent-soft: rgba(0, 196, 255, 0.14);
+      --highlight: #ff5b37;
+      --code: #060911;
+      --code-ink: #f1f5f9;
+      --inline-code: #e0f4fd;
+      --inline-code-ink: #0077cc;
+      --quote: #eef4f8;
+      --quote-ink: #334155;
+      --diagram: #ffffff;
+      --topbar: rgba(244, 247, 250, 0.92);
+      --toc-background: rgba(255, 255, 255, 0.88);
+      --toc-text: #5b6b80;
+      --error: #dc2626;
+      --shadow: 0 18px 60px rgba(6, 9, 17, 0.1);
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --background: #060911;
+      --surface: #0b1220;
+      --surface-alt: #0e1727;
+      --ink: #ffffff;
+      --strong: #ffffff;
+      --muted: #94a3b8;
+      --border: rgba(255, 255, 255, 0.09);
+      --accent: #00c4ff;
+      --accent-soft: rgba(0, 196, 255, 0.12);
+      --highlight: #ff5b37;
+      --code: #04070d;
+      --code-ink: #e8f6fd;
+      --inline-code: rgba(0, 196, 255, 0.14);
+      --inline-code-ink: #aee7ff;
+      --quote: rgba(255, 91, 55, 0.08);
+      --quote-ink: #f1f5f9;
+      --diagram: #0b1220;
+      --topbar: rgba(6, 9, 17, 0.92);
+      --toc-background: #0b1220;
+      --toc-text: #94a3b8;
+      --error: #ef4444;
+      --shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(0, 196, 255, 0.08), transparent 34rem),
+        var(--background);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.72;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      min-height: 64px;
+      padding: 10px 28px;
+      background: var(--topbar);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(16px);
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 760; color: var(--ink); text-decoration: none; }
+    .mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--highlight);
+      color: var(--code-ink);
+      font-family: Georgia, serif;
+      font-size: 20px;
+    }
+    .actions { display: flex; gap: 8px; }
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 7px 13px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: var(--surface);
+      color: var(--ink);
+      text-decoration: none;
+      font: inherit;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .button:hover { border-color: var(--accent); color: var(--accent); }
+
+    .document-nav {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 3px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-alt);
+    }
+    .nav-link {
+      padding: 6px 13px;
+      border-radius: 999px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .nav-link:hover { color: var(--accent); background: var(--surface); }
+    .nav-link.active { background: var(--accent-soft); color: var(--accent); }
+
+    .layout {
+      width: min(1540px, 100%);
+      margin: 0 auto;
+      padding: 32px 26px 80px;
+      display: grid;
+      grid-template-columns: 270px minmax(0, 980px);
+      justify-content: center;
+      gap: 34px;
+    }
+
+    .toc-wrap { position: relative; }
+    .toc {
+      position: sticky;
+      top: 92px;
+      max-height: calc(100vh - 116px);
+      overflow: auto;
+      padding: 18px 16px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--toc-background);
+    }
+    .toc-title {
+      margin: 0 0 12px;
+      color: var(--toc-text);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+    .toc a {
+      display: block;
+      margin: 2px 0;
+      padding: 5px 7px;
+      border-radius: 7px;
+      color: var(--toc-text);
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .toc a:hover { background: var(--accent-soft); color: var(--accent); }
+    .toc a.level-3 { padding-left: 20px; font-size: 12px; }
+
+    main {
+      min-width: 0;
+      padding: clamp(26px, 5vw, 64px);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    main > h1:first-child {
+      max-width: 760px;
+      margin-top: 0;
+      margin-bottom: 8px;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(38px, 6vw, 64px);
+      line-height: 1.04;
+      letter-spacing: -0.035em;
+    }
+    h2, h3, h4 { scroll-margin-top: 90px; line-height: 1.25; }
+    h2 {
+      margin: 64px 0 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(27px, 4vw, 38px);
+      letter-spacing: -0.02em;
+    }
+    h3 { margin: 36px 0 14px; font-size: 22px; }
+    h4 { margin: 28px 0 10px; font-size: 17px; color: var(--accent); }
+    p, li { max-width: 82ch; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    strong { color: var(--strong); }
+    hr { margin: 48px 0; border: 0; border-top: 1px solid var(--border); }
+
+    blockquote {
+      margin: 24px 0;
+      padding: 16px 20px;
+      border-left: 4px solid var(--highlight);
+      border-radius: 0 10px 10px 0;
+      background: var(--quote);
+      color: var(--quote-ink);
+    }
+    blockquote p { margin: 0; }
+
+    code {
+      padding: 0.18em 0.38em;
+      border-radius: 5px;
+      background: var(--inline-code);
+      color: var(--inline-code-ink);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.9em;
+    }
+    pre {
+      max-width: 100%;
+      overflow: auto;
+      margin: 22px 0;
+      padding: 20px;
+      border-radius: 12px;
+      background: var(--code);
+      color: var(--code-ink);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+      line-height: 1.5;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; }
+
+    .table-wrap { max-width: 100%; overflow-x: auto; margin: 24px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.5; }
+    th, td { padding: 11px 13px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--accent-soft); color: var(--accent); font-weight: 760; }
+    tbody tr:nth-child(even) { background: var(--surface-alt); }
+
+    .mermaid {
+      max-width: 100%;
+      overflow: auto;
+      margin: 28px 0;
+      padding: 22px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--diagram);
+      text-align: center;
+    }
+    .mermaid svg { max-width: 100%; height: auto; }
+
+    .loading, .error {
+      padding: 80px 20px;
+      text-align: center;
+      color: var(--muted);
+    }
+    .error { color: var(--error); }
+
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; padding: 18px 14px 50px; }
+      .toc-wrap { display: none; }
+      .topbar { padding: 10px 14px; gap: 10px; }
+      .brand span:last-child { display: none; }
+      main { padding: 28px 20px; border-radius: 14px; }
+    }
+
+    @media (max-width: 720px) {
+      .topbar { flex-wrap: wrap; }
+      .document-nav { order: 3; width: 100%; justify-content: center; overflow-x: auto; }
+      .nav-link { padding: 8px 14px; }
+    }
+
+    @media print {
+      body { background: white; }
+      .topbar, .toc-wrap { display: none; }
+      .layout { display: block; padding: 0; }
+      main { border: 0; box-shadow: none; padding: 0; }
+      h2 { break-after: avoid; }
+      pre, table, .mermaid { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Gamma-Native LNbits Proposal home"><span class="mark">G</span><span>Gamma-Native LNbits Proposal</span></a>
+    <nav class="document-nav" aria-label="Proposal documents">
+      <a class="nav-link" data-document="architecture" href="./">Architecture</a>
+      <a class="nav-link" data-document="research" href="?doc=research">Initial Research</a>
+    </nav>
+    <div class="actions">
+      <button class="button" id="theme-toggle" type="button">Dark mode</button>
+      <a class="button" id="source-link" href="gamma-native-python-extension-proposal.md">Source</a>
+      <button class="button" type="button" onclick="window.print()">Print</button>
+    </div>
+  </header>
+  <div class="layout">
+    <aside class="toc-wrap"><nav class="toc" id="toc"><p class="toc-title">Contents</p></nav></aside>
+    <main id="content"><div class="loading">Loading proposal…</div></main>
+  </div>
+
+  <script>
+    const content = document.getElementById('content')
+    const toc = document.getElementById('toc')
+    const themeToggle = document.getElementById('theme-toggle')
+    const activeTheme = document.documentElement.dataset.theme
+    themeToggle.textContent = activeTheme === 'dark' ? 'Light mode' : 'Dark mode'
+    themeToggle.addEventListener('click', () => {
+      const nextTheme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'
+      localStorage.setItem('proposal-theme', nextTheme)
+      document.documentElement.dataset.theme = nextTheme
+      window.location.reload()
+    })
+
+    const documents = {
+      architecture: {
+        file: 'gamma-native-python-extension-proposal.md',
+        label: 'Architecture',
+        title: 'Gamma-Native LNbits Extension Proposal',
+        loading: 'Loading architecture proposal…'
+      },
+      research: {
+        file: 'research.md',
+        label: 'Initial Research',
+        title: 'Initial Research — GammaMarkets for LNbits',
+        loading: 'Loading initial research…'
+      },
+      wasm: {
+        file: 'proposal.md',
+        label: 'WASM Proposal',
+        title: 'WASM Proposal — GammaMarkets for LNbits',
+        loading: 'Loading WASM proposal…'
+      }
+    }
+    const requestedDocument = new URLSearchParams(window.location.search).get('doc') || 'architecture'
+    const documentKey = documents[requestedDocument] ? requestedDocument : 'architecture'
+    const selectedDocument = documents[documentKey]
+
+    document.title = selectedDocument.title
+    document.getElementById('source-link').href = selectedDocument.file
+    content.innerHTML = `<div class="loading">${selectedDocument.loading}</div>`
+    document.querySelectorAll('.nav-link').forEach(link => {
+      const active = link.dataset.document === documentKey
+      link.classList.toggle('active', active)
+      if (active) link.setAttribute('aria-current', 'page')
+    })
+
+    function slugify(value, used) {
+      const base = value.toLowerCase().replace(/<[^>]+>/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'section'
+      let slug = base
+      let suffix = 2
+      while (used.has(slug)) slug = `${base}-${suffix++}`
+      used.add(slug)
+      return slug
+    }
+
+    function buildToc() {
+      const used = new Set()
+      content.querySelectorAll('h2, h3').forEach(heading => {
+        heading.id = slugify(heading.textContent, used)
+        const link = document.createElement('a')
+        link.href = `#${heading.id}`
+        link.className = `level-${heading.tagName.slice(1)}`
+        link.textContent = heading.textContent
+        toc.appendChild(link)
+      })
+    }
+
+    function wrapTables() {
+      content.querySelectorAll('table').forEach(table => {
+        const wrapper = document.createElement('div')
+        wrapper.className = 'table-wrap'
+        table.parentNode.insertBefore(wrapper, table)
+        wrapper.appendChild(table)
+      })
+    }
+
+    async function render() {
+      try {
+        const response = await fetch(selectedDocument.file)
+        if (!response.ok) throw new Error(`Unable to load ${selectedDocument.label.toLowerCase()} (${response.status})`)
+        const source = await response.text()
+        if (!window.marked) {
+          content.innerHTML = `<pre></pre>`
+          content.querySelector('pre').textContent = source
+          throw new Error('The Markdown renderer could not be loaded; showing source text instead.')
+        }
+
+        marked.setOptions({gfm: true, breaks: false})
+        content.innerHTML = marked.parse(source)
+        content.querySelectorAll('pre code.language-mermaid').forEach(code => {
+          const diagram = document.createElement('div')
+          diagram.className = 'mermaid'
+          diagram.textContent = code.textContent
+          code.parentElement.replaceWith(diagram)
+        })
+        wrapTables()
+        buildToc()
+
+        if (window.mermaid) {
+          mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'strict',
+            theme: activeTheme === 'dark' ? 'dark' : 'base',
+            themeVariables: activeTheme === 'dark'
+              ? {
+                  primaryColor: '#0e1727',
+                  primaryTextColor: '#f1f5f9',
+                  primaryBorderColor: '#00c4ff',
+                  lineColor: '#94a3b8',
+                  secondaryColor: '#1e293b',
+                  tertiaryColor: '#060911',
+                  fontFamily: 'Inter, system-ui, sans-serif'
+                }
+              : {
+                  primaryColor: '#e0f4fd',
+                  primaryTextColor: '#060911',
+                  primaryBorderColor: '#0077cc',
+                  lineColor: '#5b6b80',
+                  secondaryColor: '#e2eef7',
+                  tertiaryColor: '#f1f5f9',
+                  fontFamily: 'Inter, system-ui, sans-serif'
+                }
+          })
+          await mermaid.run({querySelector: '.mermaid'})
+        }
+      } catch (error) {
+        console.error(error)
+        const notice = document.createElement('p')
+        notice.className = 'error'
+        notice.textContent = error instanceof Error
+          ? error.message
+          : error?.str || error?.message || JSON.stringify(error, null, 2) || String(error)
+        content.prepend(notice)
+      }
+    }
+
+    render()
+  </script>
+</body>
+</html>
