@@ -153,6 +153,7 @@ unless noted.
 | location / geohash | TEXT NULL | |
 | weight_value / weight_unit | | ISO 80000-1 |
 | dim_l / dim_w / dim_h / dim_unit | | |
+| nip15_product_id | TEXT NULL | flattened id emitted in 30018 `id`/`stall_id` items and accepted in inbound NIP-15 orders; `= d_tag` for simple/variable, `<parent_d>-<variation_d>` for variations |
 | published_at | TIMESTAMP NULL | first 30402 publication |
 | revision | INTEGER NOT NULL DEFAULT 0 | incremented on every mutation; feeds outbox |
 | created_at / updated_at | | |
@@ -209,17 +210,21 @@ ISO 3166-2), `duration_min`, `duration_max`, `duration_unit` (`H|D|W`),
 | buyer_amount_sat | the `amount` tag the buyer claimed, for audit/dispute display |
 | state | §7.1 enum |
 | shipping_state | §7.2 enum |
-| contact_json | email/phone/etc., encrypted-at-rest fields §12.4 |
-| address_enc | encrypted shipping address blob (§12.4); NULL for digital |
+| contact_json | email/phone/etc., encrypted at rest per §11.3 |
+| address_enc | encrypted shipping address blob (§11.3); NULL for digital |
 | shipping_option_id FK | NULL for digital/pickup-na |
 | payment_hash | UNIQUE; set when invoice created |
 | invoice_expiry | |
 | public_token_hash | §3.3 |
 | payment_exception | BOOLEAN — late/mismatched payment flag |
+| oversold | BOOLEAN — set when an exception-resolution `accept` exceeds stock |
+| receipt_verified | BOOLEAN — buyer kind-17 receipt's bolt11+preimage checked against the settled payment (cosmetic only) |
 | created_at / updated_at | |
 
 `order_items` (order_id FK, product_id FK, product_d snapshot, title snapshot,
-quantity, unit_price_minor, currency snapshot, line_total_sat).
+quantity, unit_price_minor, currency snapshot, line_total_sat,
+`backordered_qty` INTEGER DEFAULT 0 — portion accepted as oversold on
+exception-resolution).
 `order_events` (order_id FK, from_state, to_state, actor `merchant|buyer|system|nostr`,
 detail_json, created_at) — append-only audit log; every state transition writes one row
 in the same transaction.
@@ -248,7 +253,8 @@ cannot lose them.
 long-lived signed event), `state`
 (`pending|claimed|publishing|partially_published|published|superseded|failed`),
 `attempts`, `next_attempt_at`, `claimed_by`/`claimed_at` (worker lease),
-`created_at`, `updated_at`.
+`last_error` (bounded diagnostic string, e.g. `no_inbox_relays`, relay rejection
+code — never event content), `created_at`, `updated_at`.
 
 `relay_publications`: `id` PK, `outbox_event_id` FK, `relay_url`,
 `result` (`accepted|rejected|timeout`), `message` (relay OK message, truncated to 512
@@ -262,7 +268,8 @@ chars), `attempted_at`.
 
 ### 4.12 `settings` and `migration_jobs`
 
-`settings`: key/value per merchant (e.g., `spec_revision`, feature toggles).
+`settings`: key/value per merchant (e.g., `spec_revision`, feature toggles,
+`allow_public_dm_fallback` [§9.3]).
 `migration_jobs`: `id`, `merchant_id`, `strategy`, `state`
 (`preview|validated|executing|awaiting_cutover|done|aborted`), `manifest_json`,
 `created_at`, `updated_at`.
@@ -318,7 +325,7 @@ GET   /orders/{id}                     full detail incl. decrypted address for o
 POST  /orders/{id}/status              body: {to_state} — must be a legal transition §7.1
 POST  /orders/{id}/shipping            body: {shipping_state, tracking?, carrier?, eta?}
 POST  /orders/{id}/cancel              merchant-initiated cancel with reason
-POST  /orders/{id}/resolve-exception   resolves payment_exception (refund|accept|reject)
+POST  /orders/{id}/resolve-exception   body: {action: "accept"|"refund"} — see §8.3
 GET   /orders/{id}/events              audit log
 ```
 
@@ -331,14 +338,20 @@ GET   /public/collections/{merchant_pubkey}/{d_tag}
 GET   /public/shipping/{merchant_pubkey}/{d_tag}
 POST  /public/checkout
 GET   /public/orders/{public_token}                 status, invoice, state — token-gated
+GET   /public/order-status                          same, token via X-Order-Token header
 GET   /p/{merchant_pubkey}/{d_tag}                  buyer-facing HTML product page (ui_route)
 ```
 
 Buyer browsers poll `GET /public/orders/{public_token}` (recommended interval
-5s) until `state` reaches `confirmed` or a terminal state. Because the token
-appears in the request path, deployments SHOULD exclude it from access logs;
-the token MAY alternatively be supplied via `X-Order-Token` header on
-`GET /public/order-status`.
+5s) until `state` reaches `confirmed` or a terminal state.
+
+**Token transport decision:** the path form exists deliberately — it is the
+shareable/bookmarkable order link shown to buyers post-checkout (magic-link
+semantics). Because path tokens leak via access logs and browser history,
+deployments MUST configure log redaction for `/public/orders/*` path segments,
+and API consumers SHOULD prefer `GET /public/order-status` with the token in an
+`X-Order-Token` header (never logged by default). Both forms are equivalent in
+authority; there is no weaker form.
 
 `POST /public/checkout` request:
 
@@ -525,8 +538,13 @@ total_sat, `["payment","lightning","<bolt11>"]`, `expiration`.
 optional `tracking`, `carrier`, `eta`.
 
 **kind 17 — receipt (buyer→merchant)** — `order`,
-`["payment","lightning","<bolt11>","<preimage>"]`, `amount`. Treated as a **hint
-only** — never a settlement trigger (§8.3).
+`["payment","lightning","<bolt11>","<preimage>"]`, `amount`. **Decision on
+semantics:** a receipt is evidence, never a settlement trigger. On ingest:
+match `order` → compare `bolt11` to the order's invoice and check
+`sha256(preimage) == payments.payment_hash` → if both match, set
+`orders.receipt_verified=true` (cosmetic badge only); the receipt's `amount`
+tag is stored in `order_events` as the buyer-*claimed* amount for dispute
+display and is never reconciled against `total_sat` automatically.
 
 **kind 14 — general DM** — stored, surfaced in merchant UI; optional `subject` =
 order id.
@@ -601,10 +619,16 @@ for the same `(aggregate_type, aggregate_id, event_kind)`. Order-message outbox 
 
 ### 8.1 Order intake (all protocols)
 
-1. Parse and bound input (§15 limits).
+1. Parse and bound input (§15 limits). For protocol orders, `external_id` MUST
+   match `^[A-Za-z0-9_-]{1,64}$`; anything else → reject/quarantine. Buyers can
+   squat arbitrary order IDs within their own key — that is acceptable because
+   uniqueness is scoped per buyer; the charset bound prevents injection and
+   index abuse.
 2. Resolve merchant; reject if `active=false`.
 3. Resolve each `item` reference to a canonical product owned by that merchant;
-   reject cross-merchant references.
+   reject cross-merchant references. Order currency is always **sats** — line
+   items in different fiat currencies are each converted per §3.4; mixed-
+   currency orders are permitted.
 4. Validate: products `on-sale` or `pre-order` (both purchasable; `hidden` is
    not), not draft, `nip99_status=active`; quantities ≥ 1; a `variable` parent is
    never directly purchasable — orders must name a `variation` or `simple`
@@ -659,8 +683,19 @@ One transaction:
 
 If the order is already terminal (`expired`/`cancelled`): mark payment settled, set
 `payment_exception=true`, DO NOT change state or consume reservations — merchant
-resolves via `/resolve-exception` (accept → confirm + consume; reject → refund
-flow out of scope for v1 automation, surfaced as manual task).
+resolves via `/resolve-exception`:
+
+- `accept` → transition to `confirmed`. Attempt to consume stock for each item;
+  any shortfall is recorded as `order_items.backordered_qty` and sets
+  `orders.oversold=true` (the `stock_on_hand >= 0` invariant is preserved —
+  shortfall never drives on-hand negative). An oversold order's `shipping_state`
+  is forced to `processing` until the merchant restocks and fulfills; the type-3
+  status message content MUST disclose the backorder. **Funds are accepted with
+  disclosed oversell — the merchant owes fulfillment or a manual refund.**
+- `refund` → order stays terminal; `order_events` records `refund_requested`.
+  v1 performs **no** automated outgoing payments — the merchant refunds
+  out-of-band from the LNbits wallet UI. This keeps the extension free of any
+  spend-capable credential scope.
 
 ### 8.4 Late payment
 
@@ -702,9 +737,14 @@ Worker loop:
    catalog aggregates; use stored payload for `order_msg` rows.
 4. Sign via key store (§12) with fresh `created_at`.
 5. Resolve target relays: `public` set for catalog events; recipient kind-10050 set
-   for gift wraps (fetched via `peer_relays` cache, refreshed on failure).
+   for gift wraps (fetched via `peer_relays` cache, refreshed on failure — see
+   §9.3 for the no-route policy).
 6. Publish; record one `relay_publications` row per relay.
-7. Outcome: all required relays OK → `published`; ≥1 OK → `partially_published`;
+7. Relay-clock-skew retry: if a relay rejects with a created_at/future-timestamp
+   error, retry once per relay with `created_at = now − 60s`; record both
+   attempts. Persistent skew warnings surface in relay health (possible host
+   clock drift).
+8. Outcome: all required relays OK → `published`; ≥1 OK → `partially_published`;
    none → `attempts++`, `next_attempt_at = now + backoff(attempts)`, back to
    `pending` (or `failed` after `MAX_ATTEMPTS`, surfaced in UI).
 
@@ -740,10 +780,13 @@ class NostrTransport(Protocol):
     async def health(self) -> dict[str, RelayHealth]
 ```
 
-Primary implementation: `nostr-sdk` client with per-purpose connection pools
-(public pool vs per-recipient inbox pool). Optional `nostrclient` adapter MAY handle
-public-catalog fan-out behind the same interface; it MUST NOT be used for NIP-17
-traffic until it supports per-publication relay targeting.
+**v1 decision — direct transport only.** The `nostrclient` adapter is dropped from
+v1 scope: its HTTP API is `check_admin`-gated (a merchant-scoped token cannot use
+it) and it cannot express per-publication relay targets, so the adapter would be
+dead code in practice. The `NostrTransport` interface is retained so a future
+user-scoped `nostrclient` can be slotted in without touching application services.
+v1 implementation: `nostr-sdk` client with per-purpose connection pools (public
+pool vs per-recipient inbox pool).
 
 ### 9.2 Subscriptions
 
@@ -763,9 +806,21 @@ subscription session time, not event time.
 ### 9.3 Peer inbox relays (kind 10050)
 
 Before sending any gift wrap: lookup `10050:<buyer_pubkey>` from the merchant's
-public pool; cache in `peer_relays` (TTL 24h). If absent: fallback = merchant's
-inbox set + public set (documented degradation, flagged in order_events). Gift wraps
-MUST be published ONLY to the resolved recipient set — never to the full public pool.
+public pool; cache in `peer_relays` (TTL 24h). Gift wraps MUST be published ONLY
+to the resolved recipient set.
+
+**No-route policy (decision):** publishing a wrap addressed to the buyer on the
+merchant's general/public relays exposes the merchant↔buyer DM relationship via
+the outer `p` tag — a metadata leak. Therefore there is **no silent fallback**:
+
+- No kind-10050 found → the outbox row stays `pending` with
+  `last_error='no_inbox_relays'`; lookup is retried every 15 min for 48 h (the
+  buyer may publish inbox relays later), then the row goes `failed` and the
+  merchant UI shows the order message as undeliverable.
+- A per-merchant setting `allow_public_dm_fallback` (default **off**) MAY opt
+  into publishing to the public pool; when used, `order_events` records
+  `routing=degraded` and the merchant UI must show a privacy warning at
+  enable-time.
 
 ### 9.4 NIP-42
 
@@ -902,8 +957,19 @@ Comparison via `hmac.compare_digest`. Token rotation available on merchant reque
 | images per product | ≤ 16; URL scheme `https` only; no server-side fetch |
 | checkout POST | 10/min/IP + 100/hour/IP |
 | open (unpaid) web orders per IP | ≤ 10 concurrent |
+| open orders per buyer_pubkey per merchant | ≤ 10 concurrent |
+| held reservations per product | ≤ 100 concurrent **and** ≤ available stock |
 | public GETs | 120/min/IP |
 | order DMs per buyer | 20/hour (inbound), excess → quarantine |
+
+**Stock-squatting bound (decision):** unpaid orders can only hold stock for
+`RESERVATION_TTL` (15 min), the per-IP cap throttles web churn, and the
+per-product held-reservation cap stops a distributed attacker from cycling all
+finite stock. Per-buyer_pubkey caps apply the same bound to protocol orders,
+where identity is a pubkey rather than an IP. Beyond that, squatting costs the
+attacker continuous effort for bounded denial — accepted residual risk for v1;
+a proof-of-work or invoice-first mode is a documented future mitigation, not a
+v1 requirement.
 
 Markdown render (product descriptions, message content in UI) MUST be sanitized
 (server-side allowlist renderer) — no raw HTML, no `javascript:`/`data:` URLs.
@@ -972,32 +1038,43 @@ Each section maps to proposal build phases: §4–§9 → Phases 1–3; §8.5/§
 
 ---
 
-## 21. Open questions / known gaps
+## 21. Decisions register
 
-These MUST be resolved or consciously deferred before Release B:
+Previously-open design questions, resolved. Each decision is normative for v1;
+revisit only through a spec revision.
 
-1. **Order-id authority:** the buyer chooses `order` tag value — a malicious buyer
-   can squat order IDs or stuff huge/Unicode values. Spec bounds it (64 chars,
-   `[A-Za-z0-9_-]`), but cross-merchant collisions are inherently possible; confirm
-   uniqueness scope `(merchant, protocol, buyer, external_id)` is right.
-2. **kind-17 receipt `amount` semantics:** spec says "payment amount" — ambiguous
-   vs `total_sat`; we ignore it for settlement but must define display/dispute use.
-3. **Refund path:** cancelled-after-confirm orders need an outgoing-payment
-   permission model (LNbits admin key scope) — deferred to a later release; spec
-   currently requires manual resolution only.
-4. **`stock` tag truthfulness:** publishing `available` leaks reservation volume;
-   alternatives (publish `on_hand`, or hysteresis) need a decision.
-5. **Multiple merchants per user / shared wallets:** schema allows 1:1
-   (`UNIQUE(user_id)`); multi-shop per user is a future change.
-6. **NIP-89 handler identity:** 31990 signed by merchant key treats the extension as
-   the app; a distinct app identity may be cleaner for marketplace-wide claims.
-7. **`payment_preference` default:** market-spec defaults to `manual` but service-
-   assisted mode wants a recommended app — our web checkout IS that app; confirm
-   31989/31990 publication timing vs. merchant onboarding.
-8. **Relay-side event replacement:** relays keep latest addressable event by
-   `created_at`; signing with fresh timestamps assumes relay clock tolerance —
-   define max-future skew handling if a relay rejects.
-9. **Shipping `extra-cost` currency:** market-spec says "in the product's currency"
-   but options have their own currency; define precedence when they differ.
-10. **NIP-15 order `product_id` mapping:** NIP-15 buyers reference NIP-15 product
-    ids; variation suffix mapping (§6.6) must round-trip through §8.1 — verify.
+1. **Order-id authority.** `external_id` is buyer-chosen and unforgeable across
+   buyers because uniqueness is scoped `(merchant_id, protocol, buyer_pubkey,
+   external_id)`. Charset bound `^[A-Za-z0-9_-]{1,64}$` prevents injection/index
+   abuse (§8.1). A buyer can only squat IDs against themselves — accepted.
+2. **kind-17 receipt `amount`.** Buyer-claimed amount, stored for dispute display
+   only. Receipt validity = `bolt11` match + `sha256(preimage) == payment_hash`;
+   verified receipts set a cosmetic `receipt_verified` flag (§6.9).
+3. **Refund path.** v1 has no automated outbound payments — the extension never
+   holds spend-capable scope. Exceptional refunds are merchant-manual via the
+   LNbits wallet UI after `/resolve-exception {action:"refund"}` (§8.3).
+4. **`stock` tag truthfulness.** Publish `available` (`on_hand − reserved`); the
+   reservation-volume leak is accepted — it is accurate sellable stock, which is
+   what buyers need. No hysteresis in v1.
+5. **Merchants per user.** 1:1 (`UNIQUE(user_id)`) for v1. Multi-shop is a
+   documented future schema change, not supported now.
+6. **NIP-89 handler identity.** The merchant key signs both 31989 and 31990 —
+   the extension's web checkout *is* the merchant's recommended application. A
+   distinct app identity is rejected for v1: it adds a second key with no
+   interoperability benefit.
+7. **`payment_preference`.** Always `manual` in v1. The 31989/31990 pair is
+   published at merchant activation once a wallet is configured, so service-
+   assisted buyers are directed to the web checkout per the market-spec's
+   manual+recommended-app flow.
+8. **Relay clock skew.** Sign with `created_at = now()`; on a future-timestamp
+   rejection, retry once at `now − 60s` and surface persistent skew in relay
+   health (§8.6.7).
+9. **Shipping `extra-cost` currency.** `extra-cost` is denominated in the
+   product's currency per the market-spec; the shipping option's own `price`
+   currency is independent. At order time every component (line items, option
+   base, extra-cost, weight/volume surcharges) is converted to sats
+   individually per §3.4 — currencies are never mixed arithmetically.
+10. **NIP-15 `product_id` round-trip.** Inbound NIP-15 orders carry the
+    flattened `nip15_product_id` (§4.3), stored per product; §8.1 resolves
+    `item.product_id` via that column. Simple products: `= d_tag`; variations:
+    `<parent_d>-<variation_d>` as emitted in 30018 (§6.6).
