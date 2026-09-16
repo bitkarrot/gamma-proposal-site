@@ -151,7 +151,8 @@ LNbits already provides:
 - extension startup and shutdown hooks;
 - internal browser WebSockets;
 - authentication dependencies;
-- exchange-rate utilities.
+- exchange-rate utilities;
+- host-configured SMTP email sending (`core/services/notifications.py`).
 
 This removes the need to build a wallet server or Lightning accounting system.
 
@@ -231,6 +232,7 @@ The first production release should:
 10. Support migration from an existing `nostrmarket` merchant.
 11. Preserve stable Nostr addresses across updates.
 12. Provide protocol conformance fixtures and deterministic adapter tests.
+13. Notify merchants and customers of order events by email through the host's configured SMTP transport.
 
 ### 4.2 Non-goals for the first release
 
@@ -1067,6 +1069,14 @@ The extension should register permanent, uniquely named tasks for:
 - Detect paid invoices whose event callback was interrupted.
 - Requeue missing publication intents.
 
+### 18.7 Email notification worker
+
+- Claim durable queued notification rows.
+- Deliver through the host's configured SMTP service; the extension stores no SMTP credentials.
+- Send merchant order alerts and customer opt-in status emails.
+- Retry transient failures with bounded backoff; surface permanent failures.
+- Rate-limit per recipient and per merchant; dedupe repeated state transitions.
+
 A scheduled reconciliation path is necessary because an application crash can occur between Lightning settlement and local event handling.
 
 ---
@@ -1084,6 +1094,9 @@ PATCH  /gammamarket/api/v1/merchants/{merchant_id}
 POST   /gammamarket/api/v1/merchants/{merchant_id}/keys/import
 POST   /gammamarket/api/v1/merchants/{merchant_id}/publish
 GET    /gammamarket/api/v1/merchants/{merchant_id}/relay-health
+GET    /gammamarket/api/v1/merchants/{merchant_id}/notifications
+PATCH  /gammamarket/api/v1/merchants/{merchant_id}/notifications
+POST   /gammamarket/api/v1/merchants/{merchant_id}/notifications/test
 ```
 
 ### 19.2 Catalog routes
@@ -1120,6 +1133,7 @@ GET    /gammamarket/api/v1/public/collections/{collection_id}
 GET    /gammamarket/api/v1/public/shipping/{shipping_id}
 POST   /gammamarket/api/v1/public/checkout
 GET    /gammamarket/api/v1/public/orders/{public_token}
+POST   /gammamarket/api/v1/public/order-email-opt-out
 ```
 
 Public order lookups must use high-entropy, revocable tokens rather than sequential order IDs.

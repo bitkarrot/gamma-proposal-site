@@ -256,16 +256,57 @@
     tbody tr:nth-child(even) { background: var(--surface-alt); }
 
     .mermaid {
+      position: relative;
       max-width: 100%;
       overflow: auto;
       margin: 28px 0;
-      padding: 22px;
+      padding: 54px 22px 22px;
       border: 1px solid var(--border);
       border-radius: 14px;
       background: var(--diagram);
       text-align: center;
     }
     .mermaid svg { max-width: 100%; height: auto; }
+    .diagram-expand {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 1;
+    }
+    .diagram-dialog {
+      width: calc(100vw - 32px);
+      max-width: none;
+      height: calc(100vh - 32px);
+      max-height: none;
+      margin: auto;
+      padding: 0;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: var(--shadow);
+    }
+    .diagram-dialog::backdrop { background: rgba(0, 0, 0, 0.78); }
+    .diagram-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+    .diagram-dialog-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--topbar);
+    }
+    .diagram-dialog-title { margin: 0; font-size: 16px; }
+    .diagram-dialog-actions { display: flex; gap: 8px; }
+    .diagram-dialog-canvas {
+      overflow: auto;
+      padding: 32px;
+      background: var(--diagram);
+      text-align: center;
+    }
+    .diagram-dialog-canvas svg { max-width: none; height: auto; }
 
     .loading, .error {
       padding: 80px 20px;
@@ -286,11 +327,14 @@
       .topbar { flex-wrap: wrap; }
       .document-nav { order: 3; width: 100%; justify-content: center; overflow-x: auto; }
       .nav-link { padding: 8px 14px; }
+      .diagram-dialog-header { align-items: flex-start; flex-direction: column; }
+      .diagram-dialog-actions { flex-wrap: wrap; }
+      .diagram-dialog-canvas { padding: 18px; }
     }
 
     @media print {
       body { background: white; }
-      .topbar, .toc-wrap { display: none; }
+      .topbar, .toc-wrap, .diagram-expand, .diagram-dialog { display: none; }
       .layout { display: block; padding: 0; }
       main { border: 0; box-shadow: none; padding: 0; }
       h2 { break-after: avoid; }
@@ -316,12 +360,31 @@
     <aside class="toc-wrap"><nav class="toc" id="toc"><p class="toc-title">Contents</p></nav></aside>
     <main id="content"><div class="loading">Loading proposal…</div></main>
   </div>
+  <dialog class="diagram-dialog" id="diagram-dialog" aria-labelledby="diagram-dialog-title">
+    <header class="diagram-dialog-header">
+      <h2 class="diagram-dialog-title" id="diagram-dialog-title">Diagram detail</h2>
+      <div class="diagram-dialog-actions">
+        <button class="button" id="diagram-zoom-out" type="button" aria-label="Zoom out">−</button>
+        <button class="button" id="diagram-zoom-reset" type="button">100%</button>
+        <button class="button" id="diagram-zoom-in" type="button" aria-label="Zoom in">+</button>
+        <button class="button" id="diagram-close" type="button">Close</button>
+      </div>
+    </header>
+    <div class="diagram-dialog-canvas" id="diagram-dialog-canvas"></div>
+  </dialog>
 
   <script>
     const content = document.getElementById('content')
     const toc = document.getElementById('toc')
     const themeToggle = document.getElementById('theme-toggle')
+    const diagramDialog = document.getElementById('diagram-dialog')
+    const diagramDialogCanvas = document.getElementById('diagram-dialog-canvas')
+    const diagramDialogTitle = document.getElementById('diagram-dialog-title')
+    const diagramZoomReset = document.getElementById('diagram-zoom-reset')
     const activeTheme = document.documentElement.dataset.theme
+    let expandedDiagram
+    let expandedDiagramWidth = 1400
+    let diagramZoom = 1
     themeToggle.textContent = activeTheme === 'dark' ? 'Light mode' : 'Dark mode'
     themeToggle.addEventListener('click', () => {
       const nextTheme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'
@@ -399,6 +462,59 @@
       })
     }
 
+    function updateDiagramZoom() {
+      if (!expandedDiagram) return
+      expandedDiagram.style.width = `${expandedDiagramWidth * diagramZoom}px`
+      diagramZoomReset.textContent = `${Math.round(diagramZoom * 100)}%`
+    }
+
+    function findDiagramTitle(diagram, index) {
+      let sibling = diagram.previousElementSibling
+      while (sibling && !/^H[2-4]$/.test(sibling.tagName)) sibling = sibling.previousElementSibling
+      return sibling?.textContent || `Diagram ${index + 1}`
+    }
+
+    function setupDiagramViewer() {
+      content.querySelectorAll('.mermaid').forEach((diagram, index) => {
+        const svg = diagram.querySelector('svg')
+        if (!svg) return
+        const title = findDiagramTitle(diagram, index)
+        const button = document.createElement('button')
+        button.className = 'button diagram-expand'
+        button.type = 'button'
+        button.textContent = 'Expand diagram'
+        button.setAttribute('aria-label', `Expand ${title}`)
+        button.addEventListener('click', () => {
+          const viewBox = svg.getAttribute('viewBox')?.trim().split(/\s+/).map(Number)
+          expandedDiagramWidth = Math.max(1400, viewBox?.[2] || svg.getBoundingClientRect().width)
+          expandedDiagram = svg.cloneNode(true)
+          expandedDiagram.removeAttribute('width')
+          expandedDiagram.removeAttribute('height')
+          diagramDialogTitle.textContent = title
+          diagramDialogCanvas.replaceChildren(expandedDiagram)
+          diagramZoom = 1
+          updateDiagramZoom()
+          diagramDialog.showModal()
+          diagramDialogCanvas.scrollTo(0, 0)
+        })
+        diagram.appendChild(button)
+      })
+    }
+
+    document.getElementById('diagram-close').addEventListener('click', () => diagramDialog.close())
+    document.getElementById('diagram-zoom-out').addEventListener('click', () => {
+      diagramZoom = Math.max(0.5, diagramZoom - 0.25)
+      updateDiagramZoom()
+    })
+    document.getElementById('diagram-zoom-in').addEventListener('click', () => {
+      diagramZoom = Math.min(3, diagramZoom + 0.25)
+      updateDiagramZoom()
+    })
+    diagramZoomReset.addEventListener('click', () => {
+      diagramZoom = 1
+      updateDiagramZoom()
+    })
+
     async function render() {
       try {
         const response = await fetch(selectedDocument.file)
@@ -447,6 +563,7 @@
                 }
           })
           await mermaid.run({querySelector: '.mermaid'})
+          setupDiagramViewer()
         }
       } catch (error) {
         console.error(error)

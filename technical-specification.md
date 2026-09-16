@@ -24,6 +24,7 @@ extension:
 - NIP-17/NIP-04 order-message ingestion and response;
 - order, inventory, payment, and publication state machines;
 - HTTP API surface (admin, public, migration);
+- merchant and customer order email notifications via the host SMTP transport;
 - background-task behavior;
 - key custody, encryption-at-rest, and security requirements;
 - idempotency, reliability, and concurrency requirements;
@@ -50,6 +51,90 @@ NIP-44/NIP-59 and per-relay output APIs satisfy this contract, and change a pin 
 through an explicit spec decision. Pins are surfaced in the merchant settings UI. The GammaMarkets
 revision is emitted only on public commerce events as defined in §6.8; it MUST
 NOT be added to encrypted-message wrapper tags.
+
+### 2.1 LNbits core integration architecture
+
+The following diagram defines the host boundary and the runtime flow between LNbits core
+and the `gammamarket` extension. It shows only the core integration points on which this
+specification relies; the internal LNbits implementation remains outside this contract.
+
+```mermaid
+flowchart LR
+    subgraph Clients[Clients and network]
+        Merchant[Merchant browser]
+        Buyer[Buyer browser or Nostr client]
+        Lightning[Lightning Network]
+        Relays[Nostr relays]
+    end
+
+    subgraph Core[LNbits core - host and settlement authority]
+        Host[FastAPI host and extension loader]
+        Identity[Authentication, wallet ownership, and exchange rates]
+        InvoiceService[Invoice and payment query services]
+        CorePayments[(Authoritative core payment records)]
+        Funding[Configured funding source]
+        Tasks[TaskManager invoice dispatcher]
+        Notify[Notification service and host SMTP]
+    end
+
+    subgraph Gamma[gammamarket extension - commerce authority]
+        Boundary[Extension routes and lifecycle hooks]
+        Services[Checkout, catalog, order, and settlement services]
+        PaymentAdapter[LNbits payment adapter]
+        Workers[Reconciliation, inbox, and outbox workers]
+        GammaDB[(Namespaced extension database)]
+        Transport[Direct relay-aware Nostr transport]
+    end
+
+    Host -->|1. Mount router; run migrations; call start and stop hooks| Boundary
+    Merchant -->|2. Admin HTTP requests| Host
+    Buyer -->|2. Public checkout and status polling| Host
+    Boundary --> Services
+    Boundary -->|3. Authenticate; verify wallet; obtain rates| Identity
+    Services -->|Domain transactions and reservations| GammaDB
+    Services --> PaymentAdapter
+    PaymentAdapter -->|4. create_invoice with extension and external_id| InvoiceService
+    InvoiceService -->|Create invoice| Funding
+    InvoiceService -->|Persist incoming Payment| CorePayments
+    Funding <-->|5. Invoice and settlement| Lightning
+    Funding -->|Settlement detected by core| CorePayments
+    CorePayments -->|Settled Payment notification| Tasks
+    Tasks -->|6. Registered gammamarket callback| Services
+    Services -->|Consume reservation; confirm order; enqueue messages| GammaDB
+    Workers -->|7. Query status or exact external_id after gaps or restart| InvoiceService
+    Workers -->|8. Send queued order emails via host SMTP| Notify
+    InvoiceService --> CorePayments
+    Workers <--> GammaDB
+    GammaDB -->|Pending publication intents| Transport
+    Relays -->|Encrypted orders and messages| Transport
+    Transport -->|Durably admit before processing| GammaDB
+    Transport -->|Signed catalog and order events| Relays
+```
+
+Flow and ownership rules:
+
+1. LNbits discovers the Python extension, mounts its `APIRouter`, runs its database
+   migrations, and invokes `gammamarket_start()`/`gammamarket_stop()` for managed
+   background work.
+2. HTTP traffic enters through the LNbits FastAPI host. Merchant routes use LNbits
+   authentication and wallet ownership checks; public checkout remains capability- and
+   rate-limit constrained as specified in §5 and §15.
+3. The extension owns catalog, inventory, reservation, order, inbox, outbox, and local
+   payment-projection state in its namespaced database. It MUST NOT write LNbits core
+   payment tables directly.
+4. Invoice creation crosses the boundary only through the LNbits payment service with
+   `extension="gammamarket"` and `external_id="gammamarket:<order.id>"`. LNbits core
+   persists the authoritative incoming payment and delegates Lightning operations to the
+   configured funding source.
+5. Core dispatches settled `Payment` objects through `TaskManager`; the extension's named
+   invoice listener validates extension, external id, wallet, amount, and metadata before
+   atomically confirming the order (§8.3).
+6. Reconciliation independently queries core payment state after startup, callback gaps,
+   or uncertain invoice creation (§8.2 and §8.7). Nostr transport is extension-owned and
+   reaches relays directly; relays never become authoritative for inventory or settlement.
+7. Order email notifications are queued in `email_queue` and delivered by a leased worker
+   through the host's configured SMTP transport (§8.8); the extension stores no SMTP
+   credentials and holds no spend-capable scope.
 
 ---
 
@@ -133,6 +218,8 @@ the boundary—never interpolated into SQL.
 | payment_preference | TEXT NOT NULL DEFAULT 'manual' | `manual` only in v1 |
 | recommended_app_d | TEXT | random `d` for 31990; 31989 uses fixed `d="30402"` |
 | wallet_id_enc / wallet_id_hash | BLOB/TEXT NOT NULL | encrypted LNbits wallet id + keyed lookup |
+| notify_emails | TEXT | JSON array of ≤5 validated addresses for merchant alerts (§8.8) |
+| notify_events | TEXT | JSON set of subscribed alert event types; default `order_received,confirmed,on_hold` |
 | state | TEXT NOT NULL | `draft|publication_pending|active|deactivating|inactive` |
 | created_at / updated_at | TIMESTAMP | |
 
@@ -248,6 +335,7 @@ publishing it MUST fail validation rather than silently charging zero.
 | payment_exception | BOOLEAN — late/mismatched payment flag |
 | oversold | BOOLEAN — set when an exception-resolution `accept` exceeds stock |
 | receipt_verified | BOOLEAN — buyer kind-17 receipt's bolt11+preimage checked against the settled payment (cosmetic only) |
+| email_opt_in | BOOLEAN NOT NULL DEFAULT false | customer consented to transactional order emails (§8.8) |
 | created_at / updated_at | |
 
 `order_items` (order_id FK, product_id FK, product_d snapshot, title snapshot,
@@ -362,7 +450,19 @@ apply across workers. Raw IP addresses are never stored.
 (`preview|validated|executing|awaiting_cutover|done|aborted`), `manifest_json`,
 `created_at`, `updated_at`.
 
-### 4.18 Indexes (minimum)
+### 4.18 `email_queue`
+
+`id` PK, `merchant_id` FK, `order_id` FK NULL, `channel` (`merchant|customer`),
+`event_type` (`order_received|confirmed|processing|shipped|delivered|cancelled|
+expired|on_hold|refund_requested`), `recipient_enc` BLOB, `recipient_hash` TEXT,
+`state` (`pending|claimed|sent|failed`), `attempts`, `next_attempt_at`,
+`claimed_by`/`claimed_at`, `last_error` (bounded code only), `created_at`, `sent_at`.
+UNIQUE(order_id, channel, event_type) dedupes repeated transitions. The body is
+rendered at send time from a fixed template and current order state — no rendered
+message or decrypted address is retained. Sent rows keep metadata only and are pruned
+with §11.3 retention.
+
+### 4.19 Indexes (minimum)
 
 ```text
 products(merchant_id, catalog_id)        orders(merchant_id, state)
@@ -374,6 +474,7 @@ payments(order_id) UNIQUE                payments(payment_hash) UNIQUE
 peer_relays(pubkey_hash)                 inventory_reservations(order_id, product_id) UNIQUE
 orders(merchant_id, buyer_pubkey_hash, external_id_hash) UNIQUE WHERE buyer_pubkey_hash IS NOT NULL
 orders(merchant_id, external_id_hash) UNIQUE WHERE protocol = 'web'
+email_queue(state, next_attempt_at)         email_queue(order_id)
 ```
 
 ---
@@ -399,6 +500,8 @@ PATCH  /merchants/{id}                     profile, payment_preference, wallet_i
 POST   /merchants/{id}/keys/import         body: {nsec} — over TLS only; see §11; request-body logging disabled
 POST   /merchants/{id}/publish             enqueue republication of all aggregates
 GET    /merchants/{id}/relay-health        per-relay connection/ACK summary
+GET|PATCH /merchants/{id}/notifications    notify_emails + per-event toggles (§8.8)
+POST   /merchants/{id}/notifications/test  send a test message to a configured address
 DELETE /merchants/{id}                     begin two-step deactivation (§6.7); never destroys key before tombstones are durable
 ```
 
@@ -437,6 +540,7 @@ GET   /public/collections/{merchant_pubkey}/{d_tag}
 GET   /public/shipping/{merchant_pubkey}/{d_tag}
 POST  /public/checkout
 GET   /public/order-status                          token via X-Order-Token header
+POST  /public/order-email-opt-out                   token via X-Order-Token; sets email_opt_in=false
 GET   /p/{merchant_pubkey}/{d_tag}                  buyer-facing HTML product page (ui_route)
 GET   /order                                        buyer order page; token is URL fragment only
 ```
@@ -458,7 +562,8 @@ The server sets `Referrer-Policy: no-referrer`; request/header logging MUST reda
   "items": [{"d_tag": "<product d>", "quantity": 1}],
   "shipping_option_d": "<d or null>",
   "address": {...},              // required iff any item is physical
-  "email": "...", "phone": "..." // optional contact
+  "email": "...", "phone": "...", // optional contact
+  "email_opt_in": true           // opt in to order status emails; requires `email` (§8.8)
 }
 ```
 
@@ -1035,6 +1140,48 @@ reference, then publishes the kind-5 tombstone.
 This covers crashes between reservation, invoice persistence, local projection,
 callback delivery, and outbox enqueue.
 
+### 8.8 Email notification worker
+
+Email is best-effort and never blocks an order transition. Enqueue points:
+
+- §8.1 order insert → merchant `order_received` alert.
+- §8.3 settlement → `confirmed` to merchant, and a single combined "order placed and
+  paid" email to the opted-in customer containing the order summary and the
+  `/gammamarket/order#<token>` status link. Customer sends omit `order_received` —
+  placed and paid are one event; an oversold `accept` resolution adds `on_hold` with
+  the backorder disclosure.
+- Admin status/shipping/cancel transitions → `processing`, `shipped`, `delivered`,
+  `cancelled`; `resolve-exception {refund}` → `refund_requested`; any
+  `payment_exception` flag → `on_hold`.
+- §8.4 expiry → `expired`.
+
+Send path:
+
+1. Claim rows like §8.6 (`FOR UPDATE SKIP LOCKED` / `BEGIN IMMEDIATE`) under a worker
+   lease with fencing.
+2. Skip — marking `sent`, not retrying — when host SMTP is not configured
+   (`settings.is_email_notifications_configured()` false), the merchant disabled the
+   event type, or a customer row's `email_opt_in` was revoked.
+3. Render the plaintext template. Subjects carry only the merchant display name and
+   event name — never a buyer name, address, email, pubkey, or internal order id.
+   Bodies may include item summaries, `total_sat`, state, and the public status link.
+   The link carries the bearer `public_token`; this is inherent to the magic-link
+   design and is disclosed in §19/§21.
+4. Deliver via `lnbits.core.services.notifications.send_email` (host
+   `lnbits_email_notifications_*` transport, STARTTLS). The extension MUST NOT store
+   SMTP credentials or accept a merchant-supplied relay host in v1.
+5. Success → `sent`. Transient failure → backoff `min(2^attempts * 30s, 4h) + jitter`;
+   after `EMAIL_MAX_ATTEMPTS` (default 5) → `failed`, surfaced in the merchant UI.
+   SMTP 5xx recipient rejections are terminal `failed`, not retried.
+6. Rate-limit before claim via `rate_limit_buckets` keyed on `recipient_hash` and
+   merchant id — never the raw address (§15).
+
+Email MUST NOT carry decrypted addresses, private keys, payment secrets, or full
+BOLT11/preimage material (payments correlate by `payment_hash` only). Customer sends
+are strictly opt-in per order and transactional only — no marketing use, no remote
+images or tracking pixels, no attachments. The public order page exposes an opt-out
+action that sets `email_opt_in=false` and cancels queued customer rows for that order.
+
 ---
 
 ## 9. Nostr transport
@@ -1138,6 +1285,7 @@ LNbits requires a matching stop function whenever an extension starts background
 | `relay_manager` | event-driven + 30s health tick | yes | connect/reconnect pools, restore subs |
 | `inbox_processor` | 1s/drain | yes | §8.5 durable inbox processing |
 | `outbox_publisher` | 5s | no global singleton; row claims fence work | §8.6 |
+| `email_sender` | 5s | no global singleton; row claims fence work | §8.8 |
 | invoice callback | LNbits event | registered on every worker, no lease | §8.3; DB idempotency absorbs duplicates |
 | `reservation_expiry` | 30s | yes | release expired reservations |
 | `reconciliation` | before relay start + 60s | yes | §8.7 |
@@ -1198,14 +1346,15 @@ cryptographic methods validate input lengths before allocation/decode.
 ### 11.3 Sensitive-field encryption at rest
 
 `orders.address_enc`, `orders.contact_enc`, `order_messages.content_enc`,
-`outbox_events.payload_enc`, `order_fulfillment.tracking_enc`, encrypted idempotency
+`outbox_events.payload_enc`, `order_fulfillment.tracking_enc`,
+`email_queue.recipient_enc`, encrypted idempotency
 responses, participant/external/wallet identifiers, BOLT11/checking ids, and any retained
 decrypted rumor use the same AES-256-GCM envelope with per-record/field AAD. The inbox
 stores outer ciphertext only by default; plaintext exists only during bounded processing.
 
 Equality indexes use HMAC-SHA256 under `GAMMAMARKET_PRIVACY_KEY` over
 length-prefixed purpose + merchant id + normalized value (`buyer-pubkey`, `order-id`,
-`wallet-id`, `source-wallet-id`, `client-ip` are distinct purposes). The key is backed up like the master key. Rotation
+`wallet-id`, `source-wallet-id`, `client-ip`, `email-recipient` are distinct purposes). The key is backed up like the master key. Rotation
 requires dual-index columns/read support, a complete reindex from encrypted values, and
 only then removal of the old index/key; changing it in place is forbidden.
 
@@ -1238,6 +1387,8 @@ and may be reissued only through authenticated merchant action.
 | `PEER_RELAY_TTL` | 24h | kind-10050 cache |
 | `INBOX_MAX_EVENT_BYTES` | 32768 | pre-decode cap |
 | `CHECKOUT_RATE_LIMIT` | 10/min/IP | §15 |
+| `GAMMAMARKET_EMAIL_ENABLED` | true | effective only when host `is_email_notifications_configured()`; extension holds no SMTP credentials (§8.8) |
+| `EMAIL_MAX_ATTEMPTS` | 5 | per-queue-row retry bound |
 | `SPEC_REVISION` | `5dc79c5` | shown in settings UI |
 
 ---
@@ -1266,7 +1417,7 @@ and may be reissued only through authenticated merchant action.
 
 ## 14. Idempotency, transactions, and multi-worker behavior
 
-- Idempotency uses UNIQUE constraints (§4.18) plus `idempotency_records`, never
+- Idempotency uses UNIQUE constraints (§4.19) plus `idempotency_records`, never
   check-then-insert. Public checkout requires `Idempotency-Key`; admin mutations accept
   it and SHOULD send one. Same key + different body is `409`, not replay.
 - Canonical request hashing uses method + normalized route + canonical JSON body; scope
@@ -1312,6 +1463,8 @@ and may be reissued only through authenticated merchant action.
 | public GETs | 120/min/IP |
 | order DMs per authenticated inner buyer | 20/hour, excess rejected |
 | admitted gift wraps per merchant/relay | 300/min and queue depth 1,000; excess counted/dropped before decrypt |
+| customer order emails | ≤ 1 per event type per order (UNIQUE) and ≤ 8/hour per `recipient_hash` |
+| merchant alert emails | ≤ 60/hour per merchant; test sends ≤ 5/hour |
 
 **Stock-squatting decision:** TTL and per-IP/pubkey caps bound duration and database
 amplification but do **not** prevent a distributed attacker from reserving all scarce
@@ -1407,6 +1560,10 @@ Assets and controls per proposal §21; the normative requirements here:
   enforcement (§9.5); remote product images remain a disclosed viewer-IP risk.
 - **Concurrency/failure:** invoice creation is a reconciled saga; DB transitions use
   real transactions and fencing; unsupported multi-worker topology cannot claim ready.
+- **Email:** host-SMTP only; no extension-held credentials or merchant-supplied relay
+  hosts. Subjects carry no PII; customer sends are per-order opt-in with token-gated
+  opt-out. The status link is a bearer token — email compromise grants read-only
+  order visibility, disclosed in §21.
 
 ---
 
@@ -1479,6 +1636,14 @@ revisit only through a spec revision.
     New keys are default; same-key reuse is an explicit audited operator boundary (§13).
 20. **Collection ambiguity.** Every published product belongs to at least one 30405
     collection, satisfying the pinned Gamma required-component interpretation (§6.1).
+21. **Email transport.** v1 sends through the host's configured SMTP
+    (`lnbits_email_notifications_*`) — the extension stores no SMTP credentials and
+    accepts no merchant-supplied relay host. Per-merchant SMTP would duplicate a
+    server credential boundary for marginal benefit (§8.8).
+22. **Email bearer link.** Order status emails reuse the existing
+    `/gammamarket/order#<token>` magic link rather than a second credential; email
+    possession already equals status-view possession, so a separate token adds no
+    security (§8.8/§11.4).
 
 ---
 
